@@ -164,6 +164,7 @@ class MavenApiViewSet(APIView):
                     artifact_id=content.artifact_id,
                     version=content.version,
                     filename=content.filename,
+                    sha256=content.sha256,
                     pulp_domain=get_domain(),
                 )
         ca = ContentArtifact(artifact=artifact, content=content, relative_path=path)
@@ -171,7 +172,10 @@ class MavenApiViewSet(APIView):
             ca.save()
         except IntegrityError:
             ca = ContentArtifact.objects.get(content=content, relative_path=path)
-            if not ca.artifact:
+            # Re-point whenever the stored file differs. Leaving an occupied slot
+            # alone is what made a re-upload look like it had worked while the
+            # repository went on serving the previous file.
+            if ca.artifact_id != artifact.pk:
                 ca.artifact = artifact
                 ca.save()
 
