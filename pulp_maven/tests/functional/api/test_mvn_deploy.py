@@ -2,6 +2,7 @@ import os
 import subprocess
 from urllib.parse import urljoin
 
+import aiohttp
 import pytest
 import requests
 
@@ -85,7 +86,12 @@ def test_mvn_deploy_workflow(
         "http://localhost",
         f"/pulp/maven/{repo_name}/org/sonatype/nexus/examples/simple-project/maven-metadata.xml",
     )
-    downloaded_file = download_file(pulp_unit_url)
+    # Reading through the deploy path is authorized too, so this read-back needs
+    # credentials just as the upload did.
+    downloaded_file = download_file(
+        pulp_unit_url,
+        auth=aiohttp.BasicAuth(bindings_cfg.username, bindings_cfg.password),
+    )
     assert downloaded_file.response_obj.status == 200
 
     # Assert that a GET to the Maven API redirects to the content app
