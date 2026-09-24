@@ -22,8 +22,23 @@ def _content_url(distribution, path=ARTIFACT_PATH):
     return f"{distribution.base_url.rstrip('/')}/{path}"
 
 
+def _deploy(url, data, bindings_cfg):
+    """PUT to the deploy endpoint with credentials.
+
+    Sent unconditionally so this reads the same whether or not the endpoint
+    enforces authentication.
+    """
+    return requests.put(
+        url, data=data, auth=(bindings_cfg.username, bindings_cfg.password), verify=False
+    )
+
+
 def test_redeploy_with_new_content_serves_the_new_content(
-    maven_repo_api_client, maven_repo_factory, maven_distribution_factory, pulp_settings
+    maven_repo_api_client,
+    maven_repo_factory,
+    maven_distribution_factory,
+    pulp_settings,
+    bindings_cfg,
 ):
     """A second deploy to the same coordinates must not leave the first file in place.
 
@@ -36,17 +51,21 @@ def test_redeploy_with_new_content_serves_the_new_content(
     distribution = maven_distribution_factory(repository=repo.pulp_href)
     url = _deploy_url(pulp_settings, repo.name)
 
-    assert requests.put(url, data=FIRST, verify=False).status_code == 201
+    assert _deploy(url, FIRST, bindings_cfg).status_code == 201
     downloaded = download_file(_content_url(distribution))
     assert hashlib.sha256(downloaded.body).hexdigest() == hashlib.sha256(FIRST).hexdigest()
 
-    assert requests.put(url, data=SECOND, verify=False).status_code == 201
+    assert _deploy(url, SECOND, bindings_cfg).status_code == 201
     downloaded = download_file(_content_url(distribution))
     assert hashlib.sha256(downloaded.body).hexdigest() == hashlib.sha256(SECOND).hexdigest()
 
 
 def test_redeploy_of_identical_content_does_not_create_a_repository_version(
-    maven_repo_api_client, maven_repo_factory, maven_distribution_factory, pulp_settings
+    maven_repo_api_client,
+    maven_repo_factory,
+    maven_distribution_factory,
+    pulp_settings,
+    bindings_cfg,
 ):
     """Re-uploading the same bytes stays a no-op.
 
@@ -58,10 +77,10 @@ def test_redeploy_of_identical_content_does_not_create_a_repository_version(
     maven_distribution_factory(repository=repo.pulp_href)
     url = _deploy_url(pulp_settings, repo.name)
 
-    assert requests.put(url, data=FIRST, verify=False).status_code == 201
+    assert _deploy(url, FIRST, bindings_cfg).status_code == 201
     first_version = maven_repo_api_client.read(repo.pulp_href).latest_version_href
 
-    assert requests.put(url, data=FIRST, verify=False).status_code == 201
+    assert _deploy(url, FIRST, bindings_cfg).status_code == 201
     assert maven_repo_api_client.read(repo.pulp_href).latest_version_href == first_version
 
 
@@ -71,6 +90,7 @@ def test_redeployed_repository_holds_one_artifact_per_coordinate(
     maven_repo_factory,
     maven_distribution_factory,
     pulp_settings,
+    bindings_cfg,
 ):
     """The superseded file must leave the repository rather than sit alongside it.
 
@@ -79,11 +99,11 @@ def test_redeployed_repository_holds_one_artifact_per_coordinate(
     distinct by checksum -- but only the newer one belongs to the repository.
     """
     repo = maven_repo_factory()
-    maven_distribution_factory(repository=repo.pulp_href)
+    distribution = maven_distribution_factory(repository=repo.pulp_href)
     url = _deploy_url(pulp_settings, repo.name)
 
-    requests.put(url, data=FIRST, verify=False)
-    requests.put(url, data=SECOND, verify=False)
+    _deploy(url, FIRST, bindings_cfg)
+    _deploy(url, SECOND, bindings_cfg)
 
     latest = maven_repo_api_client.read(repo.pulp_href).latest_version_href
 
@@ -91,7 +111,12 @@ def test_redeployed_repository_holds_one_artifact_per_coordinate(
         repository_version=latest, filename="redeploy-1.0.0-SNAPSHOT.jar"
     )
     assert in_repository.count == 1
-    assert in_repository.results[0].sha256 == hashlib.sha256(SECOND).hexdigest()
 
     everywhere = maven_artifact_api_client.list(filename="redeploy-1.0.0-SNAPSHOT.jar")
     assert everywhere.count == 2
+
+    # Identify the surviving unit by what the repository actually serves rather
+    # than by reading the checksum field back, so this does not depend on the
+    # generated client having been rebuilt against the current schema.
+    served = download_file(_content_url(distribution))
+    assert hashlib.sha256(served.body).hexdigest() == hashlib.sha256(SECOND).hexdigest()
