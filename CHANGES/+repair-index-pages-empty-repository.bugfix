@@ -1,0 +1,1 @@
+Fixed ``repair_index_pages`` leaving index pages in place when the repository has no other content, so emptied repositories kept serving old directory listings.

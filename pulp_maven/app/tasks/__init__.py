@@ -466,7 +466,10 @@ def repair_index_pages(repository_pk):
         for i in range(len(parts)):
             all_paths.add("" if i == 0 else "/".join(parts[:i]) + "/")
 
-    if not all_paths:
+    # A repository without other content can still hold pages left over from removed
+    # content; those must go too, or its directories keep serving old listings.
+    has_pages = MavenIndexPage.objects.filter(pk__in=latest_version.content).exists()
+    if not all_paths and not has_pages:
         log.info(
             "repair_index_pages: repository=%s has no content — nothing to do",
             repository.name,
@@ -482,7 +485,8 @@ def repair_index_pages(repository_pk):
                 new_version.remove_content(stale)
 
             # Regenerate pages for every directory using the shared implementation.
-            repository._generate_index_pages(new_version, affected_paths=all_paths)
+            if all_paths:
+                repository._generate_index_pages(new_version, affected_paths=all_paths)
     finally:
         _pull_through_ctx.active = False
 

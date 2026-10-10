@@ -986,3 +986,29 @@ def test_repair_index_pages_domain_context(
             f"'{stored_path}' — "
             f"expected prefix '{expected_prefix}' (issue #468)."
         )
+
+
+@pytest.mark.parallel
+def test_repair_index_pages_removes_pages_without_content(
+    stale_index_page_repo,
+    maven_bindings,
+    maven_repo_api_client,
+    monitor_task,
+):
+    """repair_index_pages drops every page when the repository has no other content."""
+    repo, base_url, uid, _ = stale_index_page_repo()
+    directories = ("", "com/", f"com/{uid}/")
+    for directory in directories:
+        assert download_file(urljoin(base_url, directory)).response_obj.status == 200
+
+    monitor_task(maven_repo_api_client.repair_index_pages(repo.pulp_href).task)
+
+    repo = maven_repo_api_client.read(repo.pulp_href)
+    pages = maven_bindings.ContentMavenIndexPageApi.list(
+        repository_version=repo.latest_version_href
+    )
+    assert pages.count == 0, f"pages left: {[p.path for p in pages.results]}"
+    for directory in directories:
+        with pytest.raises(aiohttp.ClientResponseError) as exc:
+            download_file(urljoin(base_url, directory))
+        assert exc.value.status == 404, f"{directory!r} still serves a listing in an empty repo"
