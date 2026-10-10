@@ -1,0 +1,1 @@
+Fixed incremental index page generation carrying forward subdirectory entries that have no content behind them, which kept parent directories listed and served after the last real content under them was removed.
