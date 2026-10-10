@@ -413,6 +413,12 @@ def repair_metadata(repository_pk):
                 pks_to_add = set(prefixes_pks) - already_present
                 if pks_to_add:
                     new_version.add_content(MavenMetadata.objects.filter(pk__in=pks_to_add))
+
+            # Finalization skips index pages while _pull_through_ctx is active, so update
+            # the listings of the directories whose metadata changed here. Otherwise
+            # removed metadata stays listed, directories left empty keep serving their
+            # old page, and restored metadata is missing from the listing.
+            repository._generate_index_pages(new_version)
     finally:
         _pull_through_ctx.active = False
 
