@@ -1,0 +1,1 @@
+Fixed ``repair_metadata`` leaving directory index pages out of date: listings now drop the metadata it removes, directories it leaves empty stop serving a page, and the metadata it restores is listed.
