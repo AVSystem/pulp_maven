@@ -1107,3 +1107,36 @@ def test_index_pages_removed_for_directories_emptied_by_removal(
     assert f'href="./k{uid}/"' in com_html
     keep_html = download_file(urljoin(base_url, f"com/k{uid}/keep/1.0.0/")).body.decode()
     assert 'href="./keep-1.0.0.jar"' in keep_html
+
+
+@pytest.mark.parallel
+def test_index_pages_drop_subdirectories_without_content(
+    stale_index_page_repo,
+    maven_repo_api_client,
+    monitor_task,
+):
+    """A regenerated page does not keep listing a subdirectory that has no content.
+
+    The repository starts with pages listing ``stale/`` although nothing exists under it.
+    Adding content under ``kept/`` regenerates ``com/{uid}/``, which must then list only
+    ``kept/``. Removing that content again empties the repository, so no directory may
+    keep serving a listing.
+    """
+    repo, base_url, uid, kept_hrefs = stale_index_page_repo()
+    group_url = urljoin(base_url, f"com/{uid}/")
+    assert 'href="./stale/"' in download_file(group_url).body.decode()
+
+    monitor_task(
+        maven_repo_api_client.modify(repo.pulp_href, {"add_content_units": kept_hrefs}).task
+    )
+    group_html = download_file(group_url).body.decode()
+    assert 'href="./kept/"' in group_html
+    assert 'href="./stale/"' not in group_html, "stale/ is listed although it has no content"
+
+    monitor_task(
+        maven_repo_api_client.modify(repo.pulp_href, {"remove_content_units": kept_hrefs}).task
+    )
+    for directory in ("", "com/", f"com/{uid}/"):
+        with pytest.raises(aiohttp.ClientResponseError) as exc:
+            download_file(urljoin(base_url, directory))
+        assert exc.value.status == 404, f"{directory!r} still serves a listing in an empty repo"
