@@ -20,3 +20,11 @@ MAVEN_DEPLOY_TASK_TIMEOUT = 30
 MAVEN_DEPLOY_BATCH = False
 MAVEN_DEPLOY_BATCH_LINGER = 1
 MAVEN_DEPLOY_BATCH_MAX_WAIT = 10
+
+# Opt-in: a file fetched through a repository's remote (pull-through) is recorded as pending
+# and served from Pulp's storage at once, and everything pulled through into a repository
+# within MAVEN_PULL_THROUGH_BATCH_WINDOW seconds is added in one repository version instead of
+# one version per file. A version costs work in proportion to the size of the repository, so a
+# build that fetches thousands of new files would otherwise create thousands of them.
+MAVEN_PULL_THROUGH_BATCH = False
+MAVEN_PULL_THROUGH_BATCH_WINDOW = 60

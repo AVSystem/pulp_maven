@@ -486,11 +486,16 @@ class MavenPendingDeploy(BaseModel):
     With ``MAVEN_DEPLOY_BATCH`` on, the deploy API stores the file and its content unit and
     records it here instead of creating a repository version for it. A commit task then adds
     everything that is pending for the repository in one version, so a publish of many files
-    costs a few versions rather than one per file.
+    costs a few versions rather than one per file. With ``MAVEN_PULL_THROUGH_BATCH`` on, files
+    fetched through the repository's remote are recorded here the same way and committed in
+    their own batches.
 
     Fields:
         relative_path (models.TextField): Where the file is served from, so that a later
             deploy of the same path within one batch replaces an earlier one.
+        pull_through (models.BooleanField): The file was fetched through the remote rather
+            than deployed. Such files get no generated metadata, as when each was added on
+            its own.
 
     Relations:
         repository (MavenRepository): The repository the file was deployed to.
@@ -502,6 +507,7 @@ class MavenPendingDeploy(BaseModel):
     )
     content = models.ForeignKey(Content, on_delete=models.CASCADE, related_name="+")
     relative_path = models.TextField()
+    pull_through = models.BooleanField(default=False)
 
     class Meta:
         default_related_name = "%(app_label)s_%(model_name)s"
@@ -523,9 +529,11 @@ class MavenDistribution(Distribution, AutoAddObjPermsMixin):
 
         Serving it makes a deployed file readable as soon as its upload is answered, as when
         every file got its own version, so a build that publishes and then resolves at once
-        does not see a 404 in between.
+        does not see a 404 in between. A file pulled through and waiting for its batch is
+        served from Pulp's storage the same way, rather than fetched from the remote again.
         """
-        if not settings.MAVEN_DEPLOY_BATCH or not self.repository_id or self.repository_version_id:
+        batching = settings.MAVEN_DEPLOY_BATCH or settings.MAVEN_PULL_THROUGH_BATCH
+        if not batching or not self.repository_id or self.repository_version_id:
             return None
         from pulpcore.plugin.models import ContentArtifact
 
@@ -691,15 +699,42 @@ class MavenRepository(Repository, AutoAddObjPermsMixin):
     REMOTE_TYPES = [MavenRemote]  # noqa: RUF012
     PULL_THROUGH_SUPPORTED = True
 
-    def pull_through_add_content(self, content_artifact):
-        """Use a task that skips metadata generation for pull-through content."""
+    def _pulled_through_already(self, content_pk):
+        """Whether the content is in the repository or waiting for its pull-through batch."""
         from pulpcore.plugin.models import RepositoryContent
 
-        cpk = content_artifact.content_id
-        already_present = RepositoryContent.objects.filter(
-            content__pk=cpk, repository=self, version_removed__isnull=True
+        if RepositoryContent.objects.filter(
+            content__pk=content_pk, repository=self, version_removed__isnull=True
+        ).exists():
+            return True
+        return MavenPendingDeploy.objects.filter(
+            repository=self, content_id=content_pk, pull_through=True
+        ).exists()
+
+    def _add_pull_through_pending(self, content_artifact):
+        """Record a file fetched through the remote for the repository's next batch."""
+        from pulp_maven.app.tasks import schedule_pull_through_commit
+
+        MavenPendingDeploy.objects.create(
+            repository=self,
+            content_id=content_artifact.content_id,
+            relative_path=content_artifact.relative_path,
+            pull_through=True,
         )
-        if not cpk or already_present.exists():
+        schedule_pull_through_commit(self)
+
+    def pull_through_add_content(self, content_artifact):
+        """Add a file fetched through the remote, skipping metadata generation.
+
+        With ``MAVEN_PULL_THROUGH_BATCH`` on, the file is recorded as pending and added with
+        everything else pulled through in the same window; otherwise it gets a task and a
+        repository version of its own.
+        """
+        cpk = content_artifact.content_id
+        if not cpk or self._pulled_through_already(cpk):
+            return None
+        if settings.MAVEN_PULL_THROUGH_BATCH:
+            self._add_pull_through_pending(content_artifact)
             return None
 
         from pulpcore.plugin.tasking import dispatch
@@ -719,14 +754,17 @@ class MavenRepository(Repository, AutoAddObjPermsMixin):
         )
 
     async def async_pull_through_add_content(self, content_artifact):
-        """Use a task that skips metadata generation for pull-through content."""
-        from pulpcore.plugin.models import RepositoryContent
+        """Add a file fetched through the remote, skipping metadata generation.
+
+        See ``pull_through_add_content``.
+        """
+        from asgiref.sync import sync_to_async
 
         cpk = content_artifact.content_id
-        already_present = RepositoryContent.objects.filter(
-            content__pk=cpk, repository=self, version_removed__isnull=True
-        )
-        if not cpk or await already_present.aexists():
+        if not cpk or await sync_to_async(self._pulled_through_already)(cpk):
+            return None
+        if settings.MAVEN_PULL_THROUGH_BATCH:
+            await sync_to_async(self._add_pull_through_pending)(content_artifact)
             return None
 
         from pulpcore.plugin.tasking import adispatch

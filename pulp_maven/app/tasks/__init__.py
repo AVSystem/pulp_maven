@@ -13,16 +13,20 @@ from xml.etree.ElementTree import Element, SubElement, tostring
 from asgiref.sync import sync_to_async
 from django.conf import settings
 from django.core.files import File
-from django.db import IntegrityError, transaction
+from django.db import IntegrityError, connection, transaction
 from django.db.models import Max, Min, Q
 from django.utils import timezone
 from redis.exceptions import RedisError
 
+from pulpcore.plugin.constants import TASK_STATES
 from pulpcore.plugin.models import (
     Artifact,
     ContentArtifact,
+    Task,
+    TaskSchedule,
 )
-from pulpcore.plugin.tasking import add_and_remove
+from pulpcore.plugin.tasking import add_and_remove, dispatch
+from pulpcore.plugin.util import get_prn
 
 from pulp_maven.app.bloom import (
     BLOOM_FILTER_CONFIG_LABEL,
@@ -330,7 +334,7 @@ def commit_pending_deploys(repository_pk):
     repository = MavenRepository.objects.get(pk=repository_pk)
     linger = datetime.timedelta(seconds=settings.MAVEN_DEPLOY_BATCH_LINGER)
     max_wait = datetime.timedelta(seconds=settings.MAVEN_DEPLOY_BATCH_MAX_WAIT)
-    pending = MavenPendingDeploy.objects.filter(repository=repository)
+    pending = MavenPendingDeploy.objects.filter(repository=repository, pull_through=False)
 
     while True:
         span = pending.aggregate(first=Min("pulp_created"), last=Max("pulp_created"))
@@ -364,6 +368,98 @@ def commit_pending_deploys(repository_pk):
             repository.name,
             len(newest_by_path),
         )
+
+
+PULL_THROUGH_COMMIT_SCHEDULE = "Add the files pulled through into Maven repository {pk}"
+
+
+def _pull_through_lock_key(repository):
+    """A Postgres advisory lock key for scheduling a repository's pull-through commit."""
+    key = f"maven-pull-through-commit:{repository.pk}"
+    return int(hashlib.sha256(key.encode()).hexdigest()[:15], 16)
+
+
+def schedule_pull_through_commit(repository):
+    """Make sure the files pulled through into a repository are committed within the window.
+
+    Each repository has a one-shot task schedule. The first file of a window sets it to fire
+    MAVEN_PULL_THROUGH_BATCH_WINDOW seconds later, and the files arriving before it fires are
+    committed with that one. A later file does not move it, so a steady stream of files still
+    gets a version every window. The schedule waits in the database, so no worker is held
+    for the length of the window.
+    """
+    name = PULL_THROUGH_COMMIT_SCHEDULE.format(pk=repository.pk)
+    due = timezone.now() + datetime.timedelta(seconds=settings.MAVEN_PULL_THROUGH_BATCH_WINDOW)
+    with transaction.atomic():
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT pg_advisory_xact_lock(%s)", [_pull_through_lock_key(repository)])
+        schedule = TaskSchedule.objects.filter(
+            name=name, pulp_domain_id=repository.pulp_domain_id
+        ).first()
+        if schedule is None:
+            TaskSchedule.objects.create(
+                name=name,
+                task_name=f"{dispatch_pull_through_commit.__module__}."
+                f"{dispatch_pull_through_commit.__name__}",
+                task_kwargs={"repository_pk": str(repository.pk)},
+                next_dispatch=due,
+                dispatch_interval=None,
+                pulp_domain_id=repository.pulp_domain_id,
+            )
+        elif schedule.next_dispatch is None:
+            schedule.next_dispatch = due
+            schedule.save(update_fields=["next_dispatch"])
+
+
+def dispatch_pull_through_commit(repository_pk):
+    """Dispatch the commit of a repository's pending pull-through files.
+
+    Run by the repository's task schedule, which cannot reserve the repository itself. The
+    commit task does, and is dispatched only if none is already waiting to run.
+    """
+    repository = MavenRepository.objects.get(pk=repository_pk)
+    with transaction.atomic():
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT pg_advisory_xact_lock(%s)", [_pull_through_lock_key(repository)])
+        commit_waiting = Task.objects.filter(
+            name=f"{commit_pending_pull_through.__module__}.{commit_pending_pull_through.__name__}",
+            state=TASK_STATES.WAITING,
+            reserved_resources_record__contains=[get_prn(repository)],
+        ).exists()
+        if not commit_waiting:
+            dispatch(
+                commit_pending_pull_through,
+                exclusive_resources=[repository],
+                kwargs={"repository_pk": str(repository.pk)},
+            )
+
+
+def commit_pending_pull_through(repository_pk):
+    """Add every file pulled through into a repository and still pending, in one version.
+
+    Files pulled through while it runs stay pending, and the repository's schedule is set
+    again for them.
+
+    Args:
+        repository_pk (str): The repository to commit pending pull-through files for.
+    """
+    repository = MavenRepository.objects.get(pk=repository_pk)
+    pending = MavenPendingDeploy.objects.filter(repository=repository, pull_through=True)
+    rows = list(pending.values_list("pk", "content_id"))
+    if rows:
+        _add_and_remove_skip_metadata(
+            repository_pk,
+            add_content_units=list({content_id for _, content_id in rows}),
+            remove_content_units=[],
+        )
+        MavenPendingDeploy.objects.filter(pk__in=[pk for pk, _ in rows]).delete()
+        log.info(
+            "Committed pending pull-through files: repository=%s, files=%d",
+            repository.name,
+            len(rows),
+        )
+    if pending.exists():
+        schedule_pull_through_commit(repository)
 
 
 def _add_and_remove_skip_metadata(*args, **kwargs):
