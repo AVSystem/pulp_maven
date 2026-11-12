@@ -16,6 +16,7 @@ def test_download_content(
     maven_repo_api_client,
     monitor_task,
     distribution_base_url,
+    pulp_settings,
 ):
     """Verify whether content served by pulp can be downloaded.
 
@@ -55,9 +56,18 @@ def test_download_content(
     assert content_response.count == 1
 
     # Pull-through cached content is automatically added to the repository.
-    # The repository version should have incremented from 0 to 1.
+    # The repository version should have incremented from 0 to 1, at once or, when
+    # pull-through is batched, once its window has passed.
+    deadline = time.monotonic() + (
+        pulp_settings.MAVEN_PULL_THROUGH_BATCH_WINDOW + 40
+        if pulp_settings.MAVEN_PULL_THROUGH_BATCH
+        else 0
+    )
     repository = maven_repo_api_client.read(repository.pulp_href)
-    assert repository.latest_version_href.endswith("/versions/1/")
+    while not repository.latest_version_href.endswith("/versions/1/"):
+        assert time.monotonic() < deadline, repository.latest_version_href
+        time.sleep(1)
+        repository = maven_repo_api_client.read(repository.pulp_href)
 
     # Verify the content is in the repository version
     repo_content = maven_artifact_api_client.list(repository_version=repository.latest_version_href)
